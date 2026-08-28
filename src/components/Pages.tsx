@@ -1,157 +1,204 @@
-import { useMemo, useState } from "react";
-import { ROLE_META, nowTime, type AuditEvent, type User } from "../data";
-import { Icon, Modal, SectionHead, useToast, type IconName } from "./ui";
+import { useEffect, useMemo, useState } from "react";
+import { ROLE_META, genToken, loadSettings, saveSettings, type AuditEvent, type Role, type StoredUser } from "../data";
+import { CopyBtn, Icon, Modal, SectionHead, useToast, type IconName } from "./ui";
 
 // ─── Пользователи ───────────────────────────────────────────────────────────
-export function UsersPage({ users, onChange, logEvent, selfLogin }: {
-  users: User[];
-  onChange: (u: User[]) => void;
-  logEvent: (t: AuditEvent["type"], sv: AuditEvent["severity"], x: string) => void;
-  selfLogin: string;
+export function UsersPage({ users, me, onAdd, onRole, onRemove }: {
+  users: StoredUser[];
+  me: string;
+  onAdd: (login: string, pw: string, role: Role) => Promise<string | null>;
+  onRole: (id: string, role: Role) => void;
+  onRemove: (id: string) => void;
 }) {
   const [modal, setModal] = useState(false);
-  const [form, setForm] = useState({ login: "", name: "", role: "operator" as User["role"] });
-  const [newPass, setNewPass] = useState<string | null>(null);
+  const [confirmDel, setConfirmDel] = useState<StoredUser | null>(null);
+  const [form, setForm] = useState({ login: "", pw: "", role: "operator" as Role });
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
   const toast = useToast();
 
-  const toggle = (u: User) => {
-    const next = users.map((x) => (x.id === u.id ? { ...x, status: x.status === "active" ? "disabled" as const : "active" as const } : x));
-    onChange(next);
-    const on = u.status !== "active";
-    toast(`Пользователь ${u.login} ${on ? "активирован" : "заблокирован"}`, on ? "ok" : "info");
-    logEvent("user", on ? "ok" : "warn", `${u.login}: учётная запись ${on ? "активирована" : "заблокирована"} (admin)`);
+  const create = async () => {
+    setErr("");
+    const lg = form.login.trim();
+    if (!/^[a-z0-9._-]{3,24}$/i.test(lg)) { setErr("Логин: 3–24 символа, латиница, цифры, . _ -"); return; }
+    if (form.pw.length < 8) { setErr("Пароль не короче 8 символов"); return; }
+    setBusy(true);
+    const res = await onAdd(lg, form.pw, form.role);
+    setBusy(false);
+    if (res) { setErr(res); return; }
+    toast(`Пользователь «${lg}» создан`, "ok");
+    setForm({ login: "", pw: "", role: "operator" });
+    setModal(false);
   };
 
-  const remove = (u: User) => {
-    onChange(users.filter((x) => x.id !== u.id));
-    toast(`Пользователь ${u.login} удалён`, "info");
-    logEvent("user", "warn", `${u.login}: учётная запись удалена (admin)`);
+  const tryRemove = (u: StoredUser) => {
+    if (u.login === me) { toast("Нельзя удалить собственную учётную запись", "err"); return; }
+    if (u.role === "admin" && users.filter((x) => x.role === "admin").length <= 1) {
+      toast("В системе должен остаться хотя бы один администратор", "err"); return;
+    }
+    setConfirmDel(u);
   };
 
-  const create = () => {
-    if (!form.login.trim() || !form.name.trim()) { toast("Заполните логин и имя", "err"); return; }
-    if (users.some((u) => u.login === form.login.trim())) { toast("Такой логин уже существует", "err"); return; }
-    const p = "kt-" + Math.random().toString(36).slice(2, 10);
-    onChange([...users, { id: "u" + Date.now(), login: form.login.trim(), name: form.name.trim(), role: form.role, status: "active", lastLogin: "ещё не входил" }]);
-    setNewPass(p);
-    logEvent("user", "ok", `создан пользователь ${form.login.trim()} (роль: ${ROLE_META[form.role].label})`);
-    toast(`Пользователь ${form.login.trim()} создан`, "ok");
-    setForm({ login: "", name: "", role: "operator" });
-  };
+  const fieldCls = "w-full bg-panel border border-line rounded-lg px-3.5 py-2.5 text-[13.5px] font-mono placeholder:text-dim focus:border-amber/60 focus:bg-panel2 transition-colors outline-none";
 
   return (
-    <div className="space-y-5">
-      <SectionHead title="Пользователи и роли" sub="Доступ к консоли: argon2id-хэши паролей, сессии 12 ч, 2FA для администраторов"
+    <div className="space-y-5 max-w-5xl">
+      <SectionHead title="Пользователи" sub="Учётные записи операторов консоли · пароли хранятся как хеши PBKDF2-SHA256"
         right={
-          <button onClick={() => { setModal(true); setNewPass(null); }} className="flex items-center gap-2 px-3.5 py-2 rounded-lg bg-amber text-bg font-display font-bold text-[12.5px] tracking-wide hover:bg-[#ffc14d] active:scale-[0.97] transition-all cursor-pointer">
+          <button onClick={() => { setModal(true); setErr(""); }}
+            className="px-3.5 py-2 rounded-lg bg-amber text-bg font-display font-bold text-[12.5px] tracking-wide hover:bg-[#ffc14d] active:scale-[0.97] transition-all cursor-pointer flex items-center gap-2">
             <Icon n="plus" size={14} /> ДОБАВИТЬ
           </button>
-        }
-      />
+        } />
 
-      <div className="grid grid-cols-3 gap-3.5 max-w-xl">
-        {([
-          ["Всего учётных записей", users.length, "users", "#56c8e8"],
-          ["Администраторы", users.filter((u) => u.role === "admin").length, "shield", "#ffb224"],
-          ["Активные сейчас", users.filter((u) => u.status === "active").length, "check", "#3ecf8e"],
-        ] as [string, number, IconName, string][]).map(([l, v, ic, c], i) => (
-          <div key={l} className="card p-4 anim-rise" style={{ animationDelay: `${i * 60}ms` }}>
-            <div className="flex items-center justify-between"><span className="lbl">{l}</span><span style={{ color: c }}><Icon n={ic} size={15} /></span></div>
-            <div className="mt-1.5 font-mono font-bold text-[26px] tnum" style={{ color: c }}>{v}</div>
-          </div>
-        ))}
-      </div>
-
-      <div className="card overflow-hidden anim-rise" style={{ animationDelay: ".15s" }}>
+      <div className="card overflow-hidden anim-rise">
         <table className="w-full text-[13px]">
           <thead>
             <tr className="text-left lbl border-b border-line bg-panel/60">
-              <th className="px-4 py-3 font-medium">Пользователь</th>
+              <th className="px-4 py-3 font-medium">Логин</th>
               <th className="px-3 py-3 font-medium">Роль</th>
-              <th className="px-3 py-3 font-medium hidden md:table-cell">Последний вход</th>
-              <th className="px-3 py-3 font-medium">Статус</th>
+              <th className="px-3 py-3 font-medium hidden md:table-cell">Права</th>
+              <th className="px-3 py-3 font-medium hidden lg:table-cell">Создан</th>
+              <th className="px-3 py-3 font-medium hidden lg:table-cell">Последний вход</th>
               <th className="px-3 py-3" />
             </tr>
           </thead>
           <tbody>
-            {users.map((u) => {
-              const rm = ROLE_META[u.role];
-              return (
-                <tr key={u.id} className="border-b border-line/60 last:border-0 hover:bg-raise/40 transition-colors">
-                  <td className="px-4 py-3">
-                    <div className="flex items-center gap-3">
-                      <span className="w-9 h-9 rounded-lg border border-line bg-panel2 flex items-center justify-center font-display font-bold text-[13px]" style={{ color: rm.color }}>
-                        {u.name.split(" ").map((w) => w[0]).join("").slice(0, 2)}
-                      </span>
-                      <div>
-                        <div className="font-medium">{u.name} {u.login === selfLogin && <span className="text-[10px] font-mono text-ok border border-ok/30 rounded px-1 py-0.5 ml-1">вы</span>}</div>
-                        <div className="font-mono text-[11.5px] text-dim">@{u.login}</div>
-                      </div>
-                    </div>
-                  </td>
-                  <td className="px-3 py-3">
-                    <select value={u.role} disabled={u.login === selfLogin}
-                      onChange={(e) => {
-                        const role = e.target.value as User["role"];
-                        onChange(users.map((x) => (x.id === u.id ? { ...x, role } : x)));
-                        logEvent("user", "info", `${u.login}: роль изменена на «${ROLE_META[role].label}»`);
-                        toast(`Роль ${u.login}: ${ROLE_META[role].label}`, "info");
-                      }}
-                      className="bg-panel border rounded-md px-2 py-1.5 font-mono text-[12px] outline-none cursor-pointer disabled:opacity-60"
-                      style={{ color: rm.color, borderColor: rm.color + "55" }}>
-                      {Object.entries(ROLE_META).map(([k, v]) => <option key={k} value={k} className="text-ink">{v.label}</option>)}
-                    </select>
-                  </td>
-                  <td className="px-3 py-3 font-mono text-[12px] text-mut hidden md:table-cell">{u.lastLogin}</td>
-                  <td className="px-3 py-3">
-                    <span className={`font-mono text-[11px] px-2 py-1 rounded-md border ${u.status === "active" ? "text-ok border-ok/30 bg-ok/8" : "text-mut border-line bg-panel"}`}>
-                      {u.status === "active" ? "активен" : "заблокирован"}
+            {users.map((u) => (
+              <tr key={u.id} className="border-b border-line/60 last:border-0 hover:bg-raise/40 transition-colors">
+                <td className="px-4 py-3">
+                  <div className="flex items-center gap-2.5">
+                    <span className="w-8 h-8 rounded-lg flex items-center justify-center font-display font-bold text-[13px] uppercase"
+                      style={{ color: ROLE_META[u.role].color, background: ROLE_META[u.role].color + "14", border: `1px solid ${ROLE_META[u.role].color}40` }}>
+                      {u.login.slice(0, 2)}
                     </span>
-                  </td>
-                  <td className="px-3 py-3">
-                    <div className="flex justify-end gap-1.5">
-                      <button onClick={() => toggle(u)} disabled={u.login === selfLogin}
-                        className="px-2.5 py-1.5 rounded-md border border-line text-[11.5px] font-mono text-mut hover:text-amber hover:border-amber/50 transition-colors cursor-pointer disabled:opacity-30">
-                        {u.status === "active" ? "заблокировать" : "активировать"}
-                      </button>
-                      <button onClick={() => remove(u)} disabled={u.login === selfLogin}
-                        className="p-1.5 rounded-md border border-line text-mut hover:text-bad hover:border-bad/50 transition-colors cursor-pointer disabled:opacity-30"><Icon n="trash" size={14} /></button>
+                    <div>
+                      <div className="font-mono font-medium">{u.login}</div>
+                      {u.login === me && <div className="font-mono text-[10px] text-amber">это вы</div>}
                     </div>
-                  </td>
-                </tr>
-              );
-            })}
+                  </div>
+                </td>
+                <td className="px-3 py-3">
+                  <select value={u.role} disabled={u.login === me}
+                    onChange={(e) => { onRole(u.id, e.target.value as Role); toast(`Роль «${u.login}» → ${ROLE_META[e.target.value as Role].label}`, "info"); }}
+                    className="bg-panel border border-line rounded-md px-2 py-1.5 font-mono text-[11.5px] cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed outline-none focus:border-amber/60"
+                    style={{ color: ROLE_META[u.role].color }}>
+                    {(Object.keys(ROLE_META) as Role[]).map((r) => (
+                      <option key={r} value={r}>{ROLE_META[r].label}</option>
+                    ))}
+                  </select>
+                </td>
+                <td className="px-3 py-3 text-[12px] text-mut hidden md:table-cell max-w-[260px]">{ROLE_META[u.role].desc}</td>
+                <td className="px-3 py-3 font-mono text-[11.5px] text-mut hidden lg:table-cell">{new Date(u.createdAt).toLocaleDateString("ru-RU")}</td>
+                <td className="px-3 py-3 font-mono text-[11.5px] text-mut hidden lg:table-cell">
+                  {u.lastLoginAt ? new Date(u.lastLoginAt).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }) : "ещё не входил"}
+                </td>
+                <td className="px-3 py-3 text-right">
+                  <button onClick={() => tryRemove(u)}
+                    className="p-1.5 rounded-md text-mut hover:text-bad hover:bg-bad/10 transition-colors cursor-pointer" title="Удалить">
+                    <Icon n="x" size={14} />
+                  </button>
+                </td>
+              </tr>
+            ))}
           </tbody>
         </table>
+        {users.length === 1 && (
+          <div className="px-4 py-3 border-t border-line bg-panel/50 text-[11.5px] text-dim font-mono">
+            Единственный администратор: защита от случайной блокировки консоли включена.
+          </div>
+        )}
       </div>
 
-      <Modal open={modal} onClose={() => setModal(false)} title="Новый пользователь" icon="users" w={460}>
-        {!newPass ? (
-          <div className="space-y-3.5">
-            {([["login", "Логин (латиница)"], ["name", "Имя и фамилия"]] as const).map(([k, l]) => (
-              <label key={k} className="block">
-                <span className="lbl block mb-1.5">{l}</span>
-                <input value={form[k]} onChange={(e) => setForm({ ...form, [k]: e.target.value })}
-                  className="w-full bg-panel border border-line rounded-lg px-3 py-2.5 text-[13.5px] font-mono focus:border-amber/60 outline-none transition-colors" />
-              </label>
-            ))}
-            <label className="block">
-              <span className="lbl block mb-1.5">Роль</span>
-              <select value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value as User["role"] })}
-                className="w-full bg-panel border border-line rounded-lg px-3 py-2.5 text-[13.5px] outline-none focus:border-amber/60 cursor-pointer">
-                {Object.entries(ROLE_META).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
-              </select>
-            </label>
-            <button onClick={create} className="w-full py-2.5 rounded-lg bg-amber text-bg font-display font-bold text-[13px] tracking-wide hover:bg-[#ffc14d] active:scale-[0.98] transition-all cursor-pointer">
-              СОЗДАТЬ И СГЕНЕРИРОВАТЬ ПАРОЛЬ
+      {/* ролевая матрица */}
+      <div className="card p-4 anim-rise" style={{ animationDelay: ".1s" }}>
+        <div className="lbl mb-3">Матрица доступа</div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-[12px] font-mono min-w-[520px]">
+            <thead>
+              <tr className="text-dim">
+                <th className="text-left font-medium pb-2">Возможность</th>
+                {(Object.keys(ROLE_META) as Role[]).map((r) => (
+                  <th key={r} className="pb-2 px-2 font-medium" style={{ color: ROLE_META[r].color }}>{ROLE_META[r].label}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {([
+                ["Метрики и статусы агентов", true, true, true],
+                ["Терминал и команды (exec)", true, true, false],
+                ["Сервисы и файлы", true, true, false],
+                ["Подключение и удаление агентов", true, false, false],
+                ["Пользователи и настройки", true, false, false],
+              ] as [string, boolean, boolean, boolean][]).map(([f, a, o, v]) => (
+                <tr key={f} className="border-t border-line/50">
+                  <td className="py-2 text-mut">{f}</td>
+                  {[a, o, v].map((x, i) => (
+                    <td key={i} className="py-2 px-2 text-center">
+                      {x ? <Icon n="check" size={13} className="text-ok inline" /> : <span className="text-dim">—</span>}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <Modal open={modal} onClose={() => setModal(false)} title="Новый пользователь" w={440}>
+        <div className="space-y-4">
+          <label className="block">
+            <span className="lbl block mb-1.5">Логин</span>
+            <input value={form.login} onChange={(e) => setForm({ ...form, login: e.target.value })} placeholder="operator-1" className={fieldCls} autoFocus />
+          </label>
+          <label className="block">
+            <span className="lbl block mb-1.5">Пароль (мин. 8 символов)</span>
+            <div className="flex gap-2">
+              <input value={form.pw} onChange={(e) => setForm({ ...form, pw: e.target.value })} type="text" placeholder="••••••••" className={fieldCls} />
+              <button onClick={() => setForm({ ...form, pw: genToken(16) })} title="Сгенерировать"
+                className="px-3 rounded-lg border border-line text-mut hover:text-amber hover:border-amber/50 transition-colors cursor-pointer">
+                <Icon n="refresh" size={15} />
+              </button>
+            </div>
+          </label>
+          <div>
+            <span className="lbl block mb-1.5">Роль</span>
+            <div className="grid grid-cols-3 gap-2">
+              {(Object.keys(ROLE_META) as Role[]).map((r) => (
+                <button key={r} onClick={() => setForm({ ...form, role: r })}
+                  className={`px-2 py-2.5 rounded-lg border text-[11.5px] font-mono transition-all cursor-pointer ${form.role === r ? "" : "border-line text-mut hover:border-line2"}`}
+                  style={form.role === r ? { borderColor: ROLE_META[r].color, color: ROLE_META[r].color, background: ROLE_META[r].color + "12" } : undefined}>
+                  {ROLE_META[r].label}
+                </button>
+              ))}
+            </div>
+            <p className="text-[11.5px] text-dim mt-2">{ROLE_META[form.role].desc}</p>
+          </div>
+          {err && <div className="flex items-center gap-2 text-[12.5px] text-bad bg-bad/8 border border-bad/25 rounded-lg px-3 py-2.5"><Icon n="alert" size={14} /> {err}</div>}
+          <div className="flex justify-end gap-2.5 pt-1">
+            <button onClick={() => setModal(false)} className="px-4 py-2.5 rounded-lg border border-line text-[13px] text-mut hover:text-ink hover:border-line2 transition-colors cursor-pointer">Отмена</button>
+            <button onClick={create} disabled={busy}
+              className="px-5 py-2.5 rounded-lg bg-amber text-bg font-display font-bold text-[13px] tracking-wide hover:bg-[#ffc14d] active:scale-[0.97] transition-all cursor-pointer disabled:opacity-60 flex items-center gap-2">
+              {busy && <span className="w-3.5 h-3.5 rounded-full border-2 border-bg/30 border-t-bg spin" />} СОЗДАТЬ
             </button>
           </div>
-        ) : (
-          <div className="text-center">
-            <span className="inline-flex w-12 h-12 rounded-full bg-ok/12 border border-ok/30 text-ok items-center justify-center mb-3"><Icon n="check" size={22} /></span>
-            <p className="text-[13.5px] text-mut">Пользователь создан. Покажите ему временный пароль <b className="text-ink">один раз</b> — он потребует смены при первом входе:</p>
-            <div className="mt-3 font-mono text-[20px] font-bold text-amber bg-[#0a0e15] border border-line rounded-lg py-3 select-all">{newPass}</div>
-            <button onClick={() => { setModal(false); }} className="mt-4 px-5 py-2.5 rounded-lg border border-line text-[13px] text-mut hover:text-ink hover:border-line2 transition-colors cursor-pointer">Готово</button>
+        </div>
+      </Modal>
+
+      <Modal open={!!confirmDel} onClose={() => setConfirmDel(null)} title="Удаление пользователя" w={420} icon="alert">
+        {confirmDel && (
+          <div className="space-y-4">
+            <p className="text-[13.5px] text-mut leading-relaxed">
+              Удалить учётную запись <span className="font-mono text-ink">{confirmDel.login}</span>?
+              Активные сессии пользователя будут закрыты, действие попадёт в аудит.
+            </p>
+            <div className="flex justify-end gap-2.5">
+              <button onClick={() => setConfirmDel(null)} className="px-4 py-2.5 rounded-lg border border-line text-[13px] text-mut hover:text-ink hover:border-line2 transition-colors cursor-pointer">Отмена</button>
+              <button onClick={() => { onRemove(confirmDel.id); toast(`Пользователь «${confirmDel.login}» удалён`, "info"); setConfirmDel(null); }}
+                className="px-5 py-2.5 rounded-lg bg-bad text-bg font-display font-bold text-[13px] tracking-wide hover:brightness-110 active:scale-[0.97] transition-all cursor-pointer">
+                УДАЛИТЬ
+              </button>
+            </div>
           </div>
         )}
       </Modal>
@@ -160,162 +207,242 @@ export function UsersPage({ users, onChange, logEvent, selfLogin }: {
 }
 
 // ─── Аудит ──────────────────────────────────────────────────────────────────
-const SEV_META: Record<AuditEvent["severity"], { l: string; c: string }> = {
-  ok: { l: "успех", c: "#3ecf8e" }, info: { l: "инфо", c: "#56c8e8" }, warn: { l: "внимание", c: "#ffb224" }, crit: { l: "критично", c: "#f0566a" },
+const SEV: Record<AuditEvent["severity"], { label: string; c: string }> = {
+  ok: { label: "ok", c: "#3ecf8e" }, info: { label: "info", c: "#56c8e8" },
+  warn: { label: "warn", c: "#ffb224" }, crit: { label: "crit", c: "#f0566a" },
 };
+const EV_ICON: Record<AuditEvent["type"], IconName> = { auth: "lock", exec: "terminal", agent: "box", service: "gear", user: "users", system: "activity" };
 
 export function AuditPage({ events }: { events: AuditEvent[] }) {
   const [sev, setSev] = useState<string>("all");
   const [type, setType] = useState<string>("all");
   const toast = useToast();
 
-  const filtered = useMemo(() => events.filter((e) => (sev === "all" || e.severity === sev) && (type === "all" || e.type === type)), [events, sev, type]);
+  const filtered = useMemo(
+    () => events.filter((e) => (sev === "all" || e.severity === sev) && (type === "all" || e.type === type)),
+    [events, sev, type]
+  );
 
   const exportCsv = () => {
-    const rows = [["time", "type", "severity", "text"], ...filtered.map((e) => [e.time, e.type, e.severity, `"${e.text.replace(/"/g, '""')}"`])];
-    const blob = new Blob(["\uFEFF" + rows.map((r) => r.join(";")).join("\n")], { type: "text/csv;charset=utf-8" });
+    const rows = [["time", "user", "type", "severity", "text"], ...filtered.map((e) => [e.time, e.user, e.type, e.severity, `"${e.text.replace(/"/g, '""')}"`].join(","))];
+    const blob = new Blob(["\uFEFF" + rows.map((r, i) => (i === 0 ? r : r)).join("\n")], { type: "text/csv;charset=utf-8" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
     a.download = `kontur-audit-${new Date().toISOString().slice(0, 10)}.csv`;
     a.click();
     URL.revokeObjectURL(a.href);
-    toast(`Экспортировано ${filtered.length} записей в CSV`, "ok");
+    toast(`Экспортировано ${filtered.length} записей`, "ok");
   };
 
+  const chip = (v: string, label: string, cur: string, set: (x: string) => void) => (
+    <button key={v} onClick={() => set(v)}
+      className={`px-2.5 py-1.5 rounded-md text-[11.5px] font-mono border transition-colors cursor-pointer ${cur === v ? "border-line2 text-ink bg-raise" : "border-line text-mut hover:border-line2"}`}>
+      {label}
+    </button>
+  );
+
   return (
-    <div className="space-y-5">
-      <SectionHead title="Журнал аудита" sub="Все действия операторов, команд агента и системные события · неизменяемый append-only лог"
+    <div className="space-y-5 max-w-5xl">
+      <SectionHead title="Журнал аудита" sub="Append-only: каждое действие оператора, агента и системы · ротация 30 дней"
         right={
-          <button onClick={exportCsv} className="flex items-center gap-2 px-3.5 py-2 rounded-lg border border-line text-[12.5px] font-mono text-mut hover:text-ok hover:border-ok/50 transition-colors cursor-pointer">
-            <Icon n="download" size={14} /> ЭКСПОРТ CSV
+          <button onClick={exportCsv} disabled={!filtered.length}
+            className="px-3.5 py-2 rounded-lg border border-line text-[12.5px] font-mono text-mut hover:text-ink hover:border-line2 transition-colors cursor-pointer disabled:opacity-40 flex items-center gap-2">
+            <Icon n="download" size={14} /> CSV · {filtered.length}
           </button>
-        }
-      />
-      <div className="flex flex-wrap gap-2">
-        <div className="flex gap-1.5 flex-wrap">
-          {[{ v: "all", l: "Все уровни" }, ...Object.entries(SEV_META).map(([v, m]) => ({ v, l: m.l }))].map((o) => (
-            <button key={o.v} onClick={() => setSev(o.v)}
-              className={`px-3 py-1.5 rounded-lg border text-[12px] font-mono transition-all cursor-pointer ${sev === o.v ? "border-amber/60 bg-amber/12 text-amber" : "border-line text-mut hover:border-line2 hover:text-ink"}`}>
-              {o.l}
-            </button>
-          ))}
-        </div>
-        <select value={type} onChange={(e) => setType(e.target.value)}
-          className="bg-panel border border-line rounded-lg px-3 py-1.5 text-[12px] font-mono text-mut outline-none cursor-pointer">
-          <option value="all">Все типы</option>
-          {["auth", "exec", "agent", "service", "user", "system"].map((t) => <option key={t} value={t}>{t}</option>)}
-        </select>
-        <span className="ml-auto font-mono text-[11.5px] text-dim self-center">{filtered.length} записей · поток live</span>
+        } />
+
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="lbl mr-1">уровень:</span>
+        {chip("all", "все", sev, setSev)}
+        {(["ok", "info", "warn", "crit"] as const).map((s) => chip(s, SEV[s].label, sev, setSev))}
+        <span className="w-px h-5 bg-line mx-1" />
+        <span className="lbl mr-1">тип:</span>
+        {chip("all", "все", type, setType)}
+        {(["auth", "exec", "agent", "service", "user", "system"] as const).map((t) => chip(t, t, type, setType))}
       </div>
 
       <div className="card overflow-hidden anim-rise">
-        <div className="max-h-[62vh] overflow-y-auto divide-y divide-line/50">
-          {filtered.map((e, i) => {
-            const sv = SEV_META[e.severity];
-            return (
-              <div key={e.id} className={`flex items-center gap-3.5 px-4 py-3 hover:bg-raise/40 transition-colors ${i === 0 ? "anim-rise" : ""}`} style={{ boxShadow: `inset 3px 0 0 ${sv.c}` }}>
-                <span className="font-mono text-[11.5px] text-dim tnum w-16 shrink-0">{e.time}</span>
-                <span className="font-mono text-[10.5px] px-2 py-0.5 rounded border w-20 text-center shrink-0" style={{ color: sv.c, borderColor: sv.c + "44", background: sv.c + "0d" }}>{e.type}</span>
-                <span className="text-[13px] text-ink/90 leading-snug">{e.text}</span>
-                <span className="ml-auto font-mono text-[10.5px] shrink-0 hidden sm:block" style={{ color: sv.c }}>{sv.l}</span>
-              </div>
-            );
-          })}
-          {filtered.length === 0 && <div className="p-10 text-center text-mut font-mono text-[12.5px]">Записей по выбранным фильтрам нет</div>}
-        </div>
+        {filtered.length === 0 ? (
+          <div className="p-10 text-center">
+            <Icon n="shield" size={26} className="text-dim mx-auto mb-3" />
+            <div className="font-display font-semibold text-[15px] mb-1">Записей нет</div>
+            <p className="text-[12.5px] text-mut">Журнал наполняется реальными действиями: входами, командами, подключениями агентов.</p>
+          </div>
+        ) : (
+          <table className="w-full text-[12.5px]">
+            <thead>
+              <tr className="text-left lbl border-b border-line bg-panel/60">
+                <th className="px-4 py-2.5 font-medium w-24">Время</th>
+                <th className="px-3 py-2.5 font-medium w-28">Кто</th>
+                <th className="px-3 py-2.5 font-medium w-24">Тип</th>
+                <th className="px-3 py-2.5 font-medium">Событие</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((e) => (
+                <tr key={e.id} className="border-b border-line/50 last:border-0 hover:bg-raise/40 transition-colors">
+                  <td className="px-4 py-2.5 font-mono text-[11.5px] text-mut whitespace-nowrap">{e.time}</td>
+                  <td className="px-3 py-2.5 font-mono text-[11.5px]">{e.user}</td>
+                  <td className="px-3 py-2.5">
+                    <span className="inline-flex items-center gap-1.5 font-mono text-[10.5px] px-1.5 py-0.5 rounded border"
+                      style={{ color: SEV[e.severity].c, borderColor: SEV[e.severity].c + "44", background: SEV[e.severity].c + "10" }}>
+                      <Icon n={EV_ICON[e.type]} size={11} /> {e.type}
+                    </span>
+                  </td>
+                  <td className="px-3 py-2.5 text-[12.5px] text-ink/85">{e.text}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
       </div>
     </div>
   );
 }
 
 // ─── Настройки ──────────────────────────────────────────────────────────────
-function Toggle({ on, onChange }: { on: boolean; onChange: (v: boolean) => void }) {
-  return (
-    <button onClick={() => onChange(!on)}
-      className={`w-11 h-6 rounded-full border transition-all cursor-pointer relative ${on ? "bg-ok/25 border-ok/50" : "bg-panel border-line2"}`}>
-      <span className={`absolute top-[3px] w-4 h-4 rounded-full transition-all ${on ? "left-[24px] bg-ok" : "left-[3px] bg-dim"}`} />
+interface Settings { twofa: boolean; whitelist: boolean; alerts: boolean; retention: number; apiKey: string; }
+
+export function SettingsPage({ me, counts, onChangePassword, onReset }: {
+  me: string;
+  counts: { agents: number; users: number; audit: number };
+  onChangePassword: (cur: string, next: string) => Promise<string | null>;
+  onReset: () => void;
+}) {
+  const toast = useToast();
+  const [opt, setOpt] = useState<Settings>(() => loadSettings<Settings>({
+    twofa: false, whitelist: false, alerts: true, retention: 30, apiKey: genToken(24),
+  }));
+  const [pwForm, setPwForm] = useState({ cur: "", next: "" });
+  const [pwErr, setPwErr] = useState("");
+  const [pwBusy, setPwBusy] = useState(false);
+  const [confirmReset, setConfirmReset] = useState(false);
+
+  useEffect(() => { saveSettings(opt); }, [opt]);
+
+  const toggle = (k: keyof Settings) => {
+    const v = !opt[k];
+    setOpt({ ...opt, [k]: v });
+    toast(`${k === "twofa" ? "Двухфакторная аутентификация" : k === "whitelist" ? "IP-allowlist" : "Алерты"}: ${v ? "включено" : "выключено"}`, v ? "ok" : "info");
+  };
+
+  const changePw = async () => {
+    setPwErr("");
+    if (pwForm.next.length < 8) { setPwErr("Новый пароль не короче 8 символов"); return; }
+    setPwBusy(true);
+    const res = await onChangePassword(pwForm.cur, pwForm.next);
+    setPwBusy(false);
+    if (res) { setPwErr(res); return; }
+    setPwForm({ cur: "", next: "" });
+    toast("Пароль изменён", "ok");
+  };
+
+  const Toggle = ({ on, onClick }: { on: boolean; onClick: () => void }) => (
+    <button onClick={onClick}
+      className={`w-10 h-[22px] rounded-full p-[3px] transition-colors cursor-pointer ${on ? "bg-ok/80" : "bg-[#26314a]"}`}>
+      <span className={`block w-4 h-4 rounded-full bg-ink transition-transform ${on ? "translate-x-[18px]" : ""}`} />
     </button>
   );
-}
 
-export function SettingsPage({ logEvent }: { logEvent: (t: AuditEvent["type"], sv: AuditEvent["severity"], x: string) => void }) {
-  const toast = useToast();
-  const [opt, setOpt] = useState({ twofa: true, whitelist: false, autoApprove: false, alerts: true });
-  const [retention, setRetention] = useState(30);
-  const [apiKey, setApiKey] = useState("kt_live_9f7c44d0b18e6a23c2e7f3a9d41b9c2e");
-
-  const set = (k: keyof typeof opt) => (v: boolean) => {
-    setOpt((o) => ({ ...o, [k]: v }));
-    const names: Record<string, string> = { twofa: "2FA для администраторов", whitelist: "IP-allowlist операторов", autoApprove: "Автоподключение новых агентов", alerts: "Алерты в Telegram" };
-    toast(`${names[k]}: ${v ? "включено" : "выключено"}`, "info");
-    logEvent("system", "info", `настройка «${names[k]}» ${v ? "включена" : "выключена"} (admin)`);
-  };
-
-  const rotate = () => {
-    const k = "kt_live_" + Array.from({ length: 32 }, () => "0123456789abcdef"[Math.floor(Math.random() * 16)]).join("");
-    setApiKey(k);
-    toast("API-ключ пересоздан, старый отозван немедленно", "ok");
-    logEvent("auth", "warn", "ротация API-ключа консоли (admin)");
-  };
+  const Row = ({ title, sub, right }: { title: string; sub: string; right: React.ReactNode }) => (
+    <div className="flex items-center justify-between gap-4 py-3.5 border-b border-line/60 last:border-0">
+      <div>
+        <div className="text-[13.5px] font-medium">{title}</div>
+        <div className="text-[11.5px] text-mut mt-0.5">{sub}</div>
+      </div>
+      {right}
+    </div>
+  );
 
   return (
-    <div className="space-y-5 max-w-3xl">
-      <SectionHead title="Настройки консоли" sub="Параметры применяются к ядру kontur-core и вступают в силу без перезапуска" />
+    <div className="space-y-5 max-w-4xl">
+      <SectionHead title="Настройки" sub="Профиль, безопасность консоли и данные веб-сборки" />
 
-      <div className="card divide-y divide-line/60 anim-rise">
+      <div className="grid md:grid-cols-3 gap-3.5">
         {([
-          ["twofa", "Двухфакторная аутентификация", "TOTP для роли admin, обязательна при входе с новых устройств"],
-          ["whitelist", "IP-allowlist операторов", "Принимать сессии только из подсетей 10.0.0.0/8 и 192.168.10.0/24"],
-          ["autoApprove", "Автоподключение агентов", "Новые агенты с валидной подписью токена попадают в реестр без подтверждения"],
-          ["alerts", "Алерты в Telegram", "Критичные события журнала дублируются в канал дежурной смены"],
-        ] as [keyof typeof opt, string, string][]).map(([k, t, d], i) => (
-          <div key={k} className="flex items-center gap-4 px-5 py-4 anim-rise" style={{ animationDelay: `${i * 50}ms` }}>
-            <div className="flex-1">
-              <div className="text-[13.5px] font-medium">{t}</div>
-              <div className="text-[12px] text-mut mt-0.5">{d}</div>
+          ["server", "Агентов в реестре", String(counts.agents), "#3ecf8e"],
+          ["users", "Пользователей", String(counts.users), "#ffb224"],
+          ["shield", "Записей аудита", String(counts.audit), "#56c8e8"],
+        ] as [IconName, string, string, string][]).map(([ic, l, v, c], i) => (
+          <div key={l} className="card p-4 anim-rise" style={{ animationDelay: `${i * 60}ms` }}>
+            <div className="flex items-center gap-2.5">
+              <span className="p-1.5 rounded-md" style={{ color: c, background: c + "14", border: `1px solid ${c}38` }}><Icon n={ic} size={14} /></span>
+              <span className="lbl">{l}</span>
             </div>
-            <Toggle on={opt[k]} onChange={set(k)} />
+            <div className="mt-2 font-mono font-bold text-[26px] tnum" style={{ color: c }}>{v}</div>
           </div>
         ))}
-        <div className="px-5 py-4">
-          <div className="flex items-center justify-between mb-2">
-            <div>
-              <div className="text-[13.5px] font-medium">Ретенция телеметрии</div>
-              <div className="text-[12px] text-mut mt-0.5">Срок хранения детальных метрик в TimescaleDB до агрегации</div>
+      </div>
+
+      {/* профиль */}
+      <div className="card p-5 anim-rise" style={{ animationDelay: ".12s" }}>
+        <div className="lbl mb-3 flex items-center gap-2"><Icon n="lock" size={13} /> профиль · {me}</div>
+        <div className="grid md:grid-cols-2 gap-4 max-w-xl">
+          <label className="block">
+            <span className="lbl block mb-1.5">Текущий пароль</span>
+            <input type="password" value={pwForm.cur} onChange={(e) => setPwForm({ ...pwForm, cur: e.target.value })}
+              placeholder="••••••••" className="w-full bg-panel border border-line rounded-lg px-3.5 py-2.5 text-[13.5px] font-mono placeholder:text-dim focus:border-amber/60 outline-none" />
+          </label>
+          <label className="block">
+            <span className="lbl block mb-1.5">Новый пароль (мин. 8)</span>
+            <input type="password" value={pwForm.next} onChange={(e) => setPwForm({ ...pwForm, next: e.target.value })}
+              placeholder="••••••••" className="w-full bg-panel border border-line rounded-lg px-3.5 py-2.5 text-[13.5px] font-mono placeholder:text-dim focus:border-amber/60 outline-none" />
+          </label>
+        </div>
+        {pwErr && <div className="mt-3 flex items-center gap-2 text-[12.5px] text-bad bg-bad/8 border border-bad/25 rounded-lg px-3 py-2.5 max-w-xl"><Icon n="alert" size={14} /> {pwErr}</div>}
+        <button onClick={changePw} disabled={pwBusy || !pwForm.cur || !pwForm.next}
+          className="mt-4 px-4 py-2.5 rounded-lg bg-amber text-bg font-display font-bold text-[12.5px] tracking-wide hover:bg-[#ffc14d] active:scale-[0.97] transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2">
+          {pwBusy && <span className="w-3.5 h-3.5 rounded-full border-2 border-bg/30 border-t-bg spin" />} СМЕНИТЬ ПАРОЛЬ
+        </button>
+      </div>
+
+      {/* безопасность консоли */}
+      <div className="card p-5 anim-rise" style={{ animationDelay: ".18s" }}>
+        <div className="lbl mb-1 flex items-center gap-2"><Icon n="shield" size={13} /> безопасность консоли</div>
+        <Row title="Двухфакторная аутентификация" sub="TOTP-код при входе для всех ролей" right={<Toggle on={opt.twofa} onClick={() => toggle("twofa")} />} />
+        <Row title="IP-allowlist для входа" sub="Принимать сессии только из корпоративной сети" right={<Toggle on={opt.whitelist} onClick={() => toggle("whitelist")} />} />
+        <Row title="Алерты в Telegram" sub="Критичные события: офлайн агента, диск > 90%, перебор паролей" right={<Toggle on={opt.alerts} onClick={() => toggle("alerts")} />} />
+        <Row title="Ротация API-ключа" sub="Ключ для внешних интеграций (webhook, CI)"
+          right={
+            <div className="flex items-center gap-2">
+              <code className="font-mono text-[11px] text-mut bg-panel border border-line rounded px-2 py-1 hidden sm:block">{opt.apiKey.slice(0, 8)}…</code>
+              <CopyBtn text={opt.apiKey} />
+              <button onClick={() => { setOpt({ ...opt, apiKey: genToken(24) }); toast("API-ключ пересоздан, старый отозван", "ok"); }}
+                className="px-2.5 py-1.5 rounded-md border border-line text-[11.5px] font-mono text-mut hover:text-amber hover:border-amber/50 transition-colors cursor-pointer">
+                ротировать
+              </button>
             </div>
-            <span className="font-mono font-bold text-amber text-[16px] tnum">{retention} дн.</span>
+          } />
+      </div>
+
+      {/* данные */}
+      <div className="card p-5 anim-rise border-bad/25" style={{ animationDelay: ".24s" }}>
+        <div className="lbl mb-1 flex items-center gap-2 text-bad"><Icon n="alert" size={13} /> опасная зона</div>
+        <Row title="Сбросить консоль"
+          sub="Удалить пользователей, сессию и настройки этого браузера. Реестр агентов в боевой системе живёт в PostgreSQL и не затрагивается."
+          right={
+            <button onClick={() => setConfirmReset(true)}
+              className="px-3.5 py-2 rounded-lg border border-bad/40 text-[12.5px] font-mono text-bad hover:bg-bad/10 transition-colors cursor-pointer">
+              сбросить
+            </button>
+          } />
+      </div>
+
+      <Modal open={confirmReset} onClose={() => setConfirmReset(false)} title="Полный сброс" w={420} icon="alert">
+        <div className="space-y-4">
+          <p className="text-[13.5px] text-mut leading-relaxed">
+            Будут удалены все пользователи (включая <span className="font-mono text-ink">{me}</span>), сессия и настройки.
+            После сброса консоль вернётся к экрану первичной настройки. Продолжить?
+          </p>
+          <div className="flex justify-end gap-2.5">
+            <button onClick={() => setConfirmReset(false)} className="px-4 py-2.5 rounded-lg border border-line text-[13px] text-mut hover:text-ink hover:border-line2 transition-colors cursor-pointer">Отмена</button>
+            <button onClick={() => { setConfirmReset(false); onReset(); }}
+              className="px-5 py-2.5 rounded-lg bg-bad text-bg font-display font-bold text-[13px] tracking-wide hover:brightness-110 active:scale-[0.97] transition-all cursor-pointer">
+              ДА, СБРОСИТЬ
+            </button>
           </div>
-          <input type="range" min={7} max={90} value={retention} onChange={(e) => setRetention(+e.target.value)}
-            onMouseUp={() => { toast(`Ретенция телеметрии: ${retention} дней`, "info"); logEvent("system", "info", `ретенция телеметрии изменена на ${retention} дн.`); }}
-            className="w-full accent-[#ffb224] cursor-pointer" />
-          <div className="flex justify-between font-mono text-[10.5px] text-dim mt-1"><span>7</span><span>90</span></div>
         </div>
-      </div>
-
-      <div className="card p-5 anim-rise" style={{ animationDelay: ".15s" }}>
-        <div className="flex items-center gap-2 mb-1"><Icon n="key" size={15} className="text-amber" /><h3 className="font-display font-semibold text-[15px]">API-ключ консоли</h3></div>
-        <p className="text-[12px] text-mut mb-3">Используется CI/CD и внешними интеграциями (scope: telemetry:read, exec:deny).</p>
-        <div className="flex items-center gap-2 flex-wrap">
-          <code className="flex-1 min-w-[240px] font-mono text-[12px] text-ok bg-[#0a0e15] border border-line rounded-lg px-3 py-2.5 truncate">{apiKey}</code>
-          <button onClick={() => { navigator.clipboard?.writeText(apiKey).catch(() => {}); toast("Ключ скопирован", "info"); }}
-            className="px-3 py-2.5 rounded-lg border border-line text-mut hover:text-amber hover:border-amber/50 transition-colors cursor-pointer"><Icon n="copy" size={15} /></button>
-          <button onClick={rotate}
-            className="px-3.5 py-2.5 rounded-lg border border-bad/40 text-bad font-mono text-[12px] hover:bg-bad/10 transition-colors cursor-pointer flex items-center gap-2">
-            <Icon n="refresh" size={14} /> ротация
-          </button>
-        </div>
-      </div>
-
-      <div className="card p-5 anim-rise font-mono text-[12px] text-mut" style={{ animationDelay: ".25s" }}>
-        <div className="lbl mb-2.5">О системе</div>
-        <div className="grid sm:grid-cols-2 gap-x-6 gap-y-1.5">
-          <span>kontur-core</span><span className="text-ink text-right">v2.4.1 (node 20.11)</span>
-          <span>kontur-agent</span><span className="text-ink text-right">v1.7.2 (go 1.22, static)</span>
-          <span>транспорт</span><span className="text-ink text-right">HTTPS + WSS, TLS 1.3</span>
-          <span>БД</span><span className="text-ink text-right">PostgreSQL 16 + TimescaleDB</span>
-          <span>сборка консоли</span><span className="text-ink text-right">{nowTime()}, uptime 14 д 06 ч</span>
-        </div>
-      </div>
+      </Modal>
     </div>
   );
 }

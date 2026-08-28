@@ -1,53 +1,74 @@
-import { useEffect, useRef, useState } from "react";
-import { Icon, useToast } from "./ui";
+import { useEffect, useState } from "react";
+import { Icon } from "./ui";
 
 const BOOT: { t: string; c?: string }[] = [
   { t: "KONTUR OPS v2.4.1 — ядро консоли (node 20.11, ws 8.16)" },
   { t: "[ ok ] подключение к БД postgres://kontur@db-01:5432/kontur", c: "ok" },
   { t: "[ ok ] миграции: 34 applied, 0 pending", c: "ok" },
   { t: "[ ok ] сборщик телеметрии: ws://0.0.0.0:8443/agent/stream", c: "ok" },
-  { t: "[ ok ] реестр агентов: 10 хостов, 8 онлайн, 1 под нагрузкой", c: "ok" },
-  { t: "[ ok ] проверка токенов агентов: 10/10 подписей валидны", c: "ok" },
-  { t: "[ ok ] RBAC: 4 пользователя, 3 роли, 2 активных сессии", c: "ok" },
+  { t: "[ ok ] реестр агентов: пуст, ожидание подключений", c: "ok" },
+  { t: "[ ok ] RBAC: пользователей нет — требуется первичная настройка", c: "warn" },
   { t: "[ ok ] журнал аудита: поток подключён, ротация 30 дней", c: "ok" },
-  { t: "[warn] backup-nfs-01: диск 91% — порог 90% превышен", c: "warn" },
-  { t: "[crit] build-runner-01: нет heartbeat 2 ч — агент офлайн", c: "crit" },
   { t: "[ ok ] консоль готова. Требуется авторизация оператора." },
 ];
 
-export default function Login({ onLogin }: { onLogin: (login: string, remember: boolean) => void }) {
+export default function Login({ mode, busy, error, onLogin, onCreate }: {
+  mode: "setup" | "login";
+  busy: boolean;
+  error: string | null;
+  onLogin: (login: string, pw: string, remember: boolean) => void;
+  onCreate: (login: string, pw: string) => void;
+}) {
   const [shown, setShown] = useState(0);
   const [login, setLogin] = useState("");
-  const [pass, setPass] = useState("");
+  const [pw, setPw] = useState("");
+  const [pw2, setPw2] = useState("");
   const [remember, setRemember] = useState(true);
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
+  const [localErr, setLocalErr] = useState("");
   const [shake, setShake] = useState(0);
-  const toast = useToast();
-  const formRef = useRef<HTMLFormElement>(null);
 
   useEffect(() => {
     const t = setInterval(() => setShown((s) => (s < BOOT.length ? s + 1 : s)), 240);
     return () => clearInterval(t);
   }, []);
 
+  useEffect(() => { if (error) setShake((x) => x + 1); }, [error]);
+
+  const strength = (() => {
+    let sc = 0;
+    if (pw.length >= 8) sc++;
+    if (pw.length >= 12) sc++;
+    if (/[a-z]/.test(pw) && /[A-Z]/.test(pw)) sc++;
+    if (/\d/.test(pw)) sc++;
+    if (/[^a-zA-Z0-9]/.test(pw)) sc++;
+    return Math.min(4, sc);
+  })();
+  const strengthMeta = [
+    { w: "0%", c: "#3a4a63", t: "" },
+    { w: "25%", c: "#f0566a", t: "слабый" },
+    { w: "50%", c: "#ffb224", t: "средний" },
+    { w: "75%", c: "#56c8e8", t: "хороший" },
+    { w: "100%", c: "#3ecf8e", t: "надёжный" },
+  ][strength];
+
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
     if (busy) return;
-    setErr("");
-    if (!login.trim() || !pass) { setErr("Заполните логин и пароль"); setShake((x) => x + 1); return; }
-    setBusy(true);
-    setTimeout(() => {
-      if (login.trim().toLowerCase() === "admin" && pass === "kontur") {
-        toast(`Добро пожаловать, ${login}. Сессия защищена TLS 1.3`, "ok");
-        onLogin(login.trim(), remember);
-      } else {
-        setBusy(false);
-        setErr("Неверные учётные данные. Попытка записана в аудит.");
-        setShake((x) => x + 1);
-      }
-    }, 900);
+    setLocalErr("");
+    const lg = login.trim();
+    if (!lg || !pw) { setLocalErr("Заполните все поля"); setShake((x) => x + 1); return; }
+    if (mode === "setup") {
+      if (!/^[a-z0-9._-]{3,24}$/i.test(lg)) { setLocalErr("Логин: 3–24 символа, латиница, цифры, . _ -"); setShake((x) => x + 1); return; }
+      if (pw.length < 8) { setLocalErr("Пароль не короче 8 символов"); setShake((x) => x + 1); return; }
+      if (pw !== pw2) { setLocalErr("Пароли не совпадают"); setShake((x) => x + 1); return; }
+      onCreate(lg, pw);
+    } else {
+      onLogin(lg, pw, remember);
+    }
   };
+
+  const err = localErr || error;
+  const fieldCls = "w-full bg-panel border border-line rounded-lg px-3.5 py-2.5 text-[14px] font-mono placeholder:text-dim focus:border-amber/60 focus:bg-panel2 transition-colors outline-none";
 
   return (
     <div className="min-h-screen flex items-stretch">
@@ -70,9 +91,7 @@ export default function Login({ onLogin }: { onLogin: (login: string, remember: 
           {BOOT.slice(0, shown).map((l, i) => (
             <div key={i} className="anim-rise whitespace-pre-wrap">
               <span className="text-dim mr-2 select-none">{String(i).padStart(2, "0")}</span>
-              <span className={l.c === "ok" ? "text-ok" : l.c === "warn" ? "text-amber" : l.c === "crit" ? "text-bad" : "text-ink/85"}>
-                {l.c ? l.t.slice(0, 6) : ""}<span className={l.c ? "" : ""}>{l.c ? l.t.slice(7) : l.t}</span>
-              </span>
+              <span className={l.c === "ok" ? "text-ok" : l.c === "warn" ? "text-amber" : l.c === "crit" ? "text-bad" : "text-ink/85"}>{l.t}</span>
             </div>
           ))}
           <span className="caret inline-block w-2 h-4 bg-amber align-middle ml-1" />
@@ -87,33 +106,53 @@ export default function Login({ onLogin }: { onLogin: (login: string, remember: 
 
       {/* правая панель: форма */}
       <div className="flex-1 flex items-center justify-center p-6">
-        <div className="w-full max-w-[400px] anim-rise" style={{ animationDelay: ".15s" }}>
+        <div className="w-full max-w-[420px] anim-rise" style={{ animationDelay: ".15s" }}>
           <div className="lg:hidden flex items-center gap-3 mb-8 justify-center">
             <BrandMark small />
             <div className="font-display font-extrabold text-xl tracking-widest">KONTUR<span className="text-amber">·OPS</span></div>
           </div>
 
-          <div className="lbl mb-2 flex items-center gap-2"><Icon n="lock" size={13} /> авторизация оператора</div>
-          <h1 className="font-display text-[26px] font-bold leading-tight mb-1">Вход в консоль</h1>
-          <p className="text-[13px] text-mut mb-7">Доступ журналируется. Роли: администратор · оператор · наблюдатель.</p>
+          <div className="lbl mb-2 flex items-center gap-2">
+            <Icon n={mode === "setup" ? "shield" : "lock"} size={13} />
+            {mode === "setup" ? "первичная настройка" : "авторизация оператора"}
+          </div>
+          <h1 className="font-display text-[26px] font-bold leading-tight mb-1">
+            {mode === "setup" ? "Создание учётной записи администратора" : "Вход в консоль"}
+          </h1>
+          <p className="text-[13px] text-mut mb-7">
+            {mode === "setup"
+              ? "Первый запуск: предзаданных пользователей нет. Пароль хранится в виде хеша PBKDF2-SHA256 (150 000 итераций)."
+              : "Доступ журналируется. Роли: администратор · оператор · наблюдатель."}
+          </p>
 
-          <form ref={formRef} onSubmit={submit} key={shake} className={`space-y-4 ${shake ? "anim-shake" : ""}`}>
+          <form onSubmit={submit} key={shake} className={`space-y-4 ${shake ? "anim-shake" : ""}`}>
             <label className="block">
               <span className="lbl block mb-1.5">Логин</span>
-              <input
-                value={login} onChange={(e) => setLogin(e.target.value)} autoFocus autoComplete="username"
-                placeholder="admin"
-                className="w-full bg-panel border border-line rounded-lg px-3.5 py-2.5 text-[14px] font-mono placeholder:text-dim focus:border-amber/60 focus:bg-panel2 transition-colors outline-none"
-              />
+              <input value={login} onChange={(e) => setLogin(e.target.value)} autoFocus autoComplete="username"
+                placeholder={mode === "setup" ? "например, admin" : "логин"} className={fieldCls} />
             </label>
+
             <label className="block">
               <span className="lbl block mb-1.5">Пароль</span>
-              <input
-                value={pass} onChange={(e) => setPass(e.target.value)} type="password" autoComplete="current-password"
-                placeholder="••••••••"
-                className="w-full bg-panel border border-line rounded-lg px-3.5 py-2.5 text-[14px] font-mono placeholder:text-dim focus:border-amber/60 focus:bg-panel2 transition-colors outline-none"
-              />
+              <input value={pw} onChange={(e) => setPw(e.target.value)} type="password"
+                autoComplete={mode === "setup" ? "new-password" : "current-password"} placeholder="••••••••" className={fieldCls} />
+              {mode === "setup" && pw.length > 0 && (
+                <div className="mt-2 flex items-center gap-2.5">
+                  <div className="h-1 flex-1 rounded-full bg-[#1a2436] overflow-hidden">
+                    <div className="h-full transition-all duration-300" style={{ width: strengthMeta.w, background: strengthMeta.c }} />
+                  </div>
+                  <span className="font-mono text-[10.5px]" style={{ color: strengthMeta.c }}>{strengthMeta.t}</span>
+                </div>
+              )}
             </label>
+
+            {mode === "setup" && (
+              <label className="block">
+                <span className="lbl block mb-1.5">Повторите пароль</span>
+                <input value={pw2} onChange={(e) => setPw2(e.target.value)} type="password" autoComplete="new-password"
+                  placeholder="••••••••" className={fieldCls} />
+              </label>
+            )}
 
             {err && (
               <div className="flex items-center gap-2 text-[12.5px] text-bad bg-bad/8 border border-bad/25 rounded-lg px-3 py-2.5">
@@ -121,33 +160,33 @@ export default function Login({ onLogin }: { onLogin: (login: string, remember: 
               </div>
             )}
 
-            <label className="flex items-center gap-2.5 text-[13px] text-mut cursor-pointer select-none">
-              <button type="button" onClick={() => setRemember((r) => !r)}
-                className={`w-4.5 h-4.5 w-[18px] h-[18px] rounded border flex items-center justify-center transition-colors cursor-pointer ${remember ? "bg-amber border-amber text-bg" : "border-line2 bg-panel"}`}>
-                {remember && <Icon n="check" size={12} />}
-              </button>
-              Запомнить сессию на этом устройстве
-            </label>
+            {mode === "login" && (
+              <label className="flex items-center gap-2.5 text-[13px] text-mut cursor-pointer select-none">
+                <button type="button" onClick={() => setRemember((r) => !r)}
+                  className={`w-[18px] h-[18px] rounded border flex items-center justify-center transition-colors cursor-pointer ${remember ? "bg-amber border-amber text-bg" : "border-line2 bg-panel"}`}>
+                  {remember && <Icon n="check" size={12} />}
+                </button>
+                Запомнить сессию (12 часов)
+              </label>
+            )}
 
-            <button
-              type="submit" disabled={busy}
-              className="w-full relative overflow-hidden rounded-lg py-3 font-display font-bold text-[14px] tracking-wider text-bg bg-amber hover:bg-[#ffc14d] active:scale-[0.985] transition-all cursor-pointer disabled:opacity-70 flex items-center justify-center gap-2.5"
-            >
-              {busy ? (<><span className="w-4 h-4 rounded-full border-2 border-bg/30 border-t-bg spin" /> ПРОВЕРКА ТОКЕНА СЕССИИ…</>) : (<>ВОЙТИ В КОНСОЛЬ <Icon n="chevR" size={15} /></>)}
+            <button type="submit" disabled={busy}
+              className="w-full relative overflow-hidden rounded-lg py-3 font-display font-bold text-[14px] tracking-wider text-bg bg-amber hover:bg-[#ffc14d] active:scale-[0.985] transition-all cursor-pointer disabled:opacity-70 flex items-center justify-center gap-2.5">
+              {busy
+                ? (<><span className="w-4 h-4 rounded-full border-2 border-bg/30 border-t-bg spin" /> {mode === "setup" ? "ХЕШИРОВАНИЕ PBKDF2…" : "ПРОВЕРКА…"}</>)
+                : (<>{mode === "setup" ? "СОЗДАТЬ АДМИНИСТРАТОРА" : <>ВОЙТИ В КОНСОЛЬ <Icon n="chevR" size={15} /></>}</>)}
             </button>
           </form>
 
-          <div className="mt-6 card px-4 py-3 flex items-center justify-between gap-3">
-            <div className="text-[12px] text-mut">Демо-доступ:<br /><span className="font-mono text-ink">admin / kontur</span></div>
-            <button
-              onClick={() => { setLogin("admin"); setPass("kontur"); setErr(""); toast("Учётные данные подставлены", "info"); }}
-              className="px-3 py-1.5 rounded-md border border-line text-[12px] font-mono text-info hover:border-info/50 hover:bg-info/10 transition-colors cursor-pointer whitespace-nowrap"
-            >
-              подставить
-            </button>
-          </div>
-
-          <p className="mt-6 text-center font-mono text-[10.5px] text-dim tracking-wider">TLS 1.3 · argon2id · аудит действий · v2.4.1</p>
+          {mode === "setup" ? (
+            <div className="mt-6 card px-4 py-3 text-[12px] text-mut leading-relaxed flex gap-2.5">
+              <span className="text-amber mt-0.5 shrink-0"><Icon n="shield" size={15} /></span>
+              Учётная запись сохраняется локально в этом браузере. В боевом развёртывании пользователи живут в PostgreSQL,
+              а первый администратор создаётся при миграциях — см. раздел «Установка консоли» документации.
+            </div>
+          ) : (
+            <p className="mt-6 text-center font-mono text-[10.5px] text-dim tracking-wider">TLS 1.3 · PBKDF2-SHA256 · аудит действий · v2.4.1</p>
+          )}
         </div>
       </div>
     </div>

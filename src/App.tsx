@@ -1,297 +1,390 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  INITIAL_EVENTS, LIVE_EVENT_POOL, SERVERS, USERS, nowTime, seedMetrics, stepMetrics,
-  type AuditEvent, type MetricsMap, type Server, type User,
-} from "./data";
-import Login, { BrandMark } from "./components/Login";
+import { useCallback, useEffect, useRef, useState } from "react";
+import AddAgent from "./components/AddAgent";
 import Dashboard from "./components/Dashboard";
-import Servers from "./components/Servers";
-import ServerDetail from "./components/ServerDetail";
-import { AuditPage, SettingsPage, UsersPage } from "./components/Pages";
 import Docs from "./components/Docs";
+import Login, { BrandMark } from "./components/Login";
+import { AuditPage, SettingsPage, UsersPage } from "./components/Pages";
+import ServerDetail from "./components/ServerDetail";
+import Servers from "./components/Servers";
 import Terminal from "./components/Terminal";
-import { Icon, ToastProvider, useToast, type IconName } from "./components/ui";
+import { Icon, ToastProvider, useNow, useToast, type IconName } from "./components/ui";
+import {
+  POINTS, ROLE_META, clearSession, getStoredUsers, getSession, hashPassword, resetAll, saveUsers,
+  setSession, spawnSim, stopSim, timeStr, uid, verifyPassword,
+  type AuditEvent, type Metrics, type MetricsMap, type Role, type Server, type StoredUser,
+} from "./data";
 
-type Page =
-  | { name: "dashboard" } | { name: "servers" } | { name: "server"; id: string; tab: string }
-  | { name: "terminal" } | { name: "users" } | { name: "audit" } | { name: "docs" } | { name: "settings" };
+type Tab = "dashboard" | "servers" | "detail" | "terminal" | "users" | "audit" | "settings" | "docs";
 
-const PAGE_TITLE: Record<Page["name"], string> = {
-  dashboard: "Обзор флота", servers: "Реестр агентов", server: "Карточка сервера",
-  terminal: "Глобальный терминал", users: "Пользователи", audit: "Журнал аудита",
-  docs: "Архитектура и API", settings: "Настройки",
+const NAV: { id: Tab; label: string; icon: IconName }[] = [
+  { id: "dashboard", label: "Обзор", icon: "grid" },
+  { id: "servers", label: "Агенты", icon: "server" },
+  { id: "terminal", label: "Терминал", icon: "terminal" },
+  { id: "users", label: "Пользователи", icon: "users" },
+  { id: "audit", label: "Аудит", icon: "shield" },
+  { id: "settings", label: "Настройки", icon: "gear" },
+  { id: "docs", label: "Документация", icon: "book" },
+];
+
+const clamp = (v: number, a: number, b: number) => Math.min(b, Math.max(a, v));
+
+const seedFor = (s: Server): Metrics => {
+  const cpu: number[] = []; const mem: number[] = []; const netIn: number[] = []; const netOut: number[] = [];
+  for (let i = 0; i < POINTS; i++) {
+    cpu.push(clamp(s.baseCpu + Math.sin(i / 3) * 5 + (Math.random() * 10 - 5), 2, 96));
+    mem.push(clamp(s.baseMem + Math.sin(i / 5) * 3 + (Math.random() * 6 - 3), 5, 97));
+    netIn.push(Math.random() * 60 + 5);
+    netOut.push(Math.random() * 30 + 2);
+  }
+  return { cpu, mem, netIn, netOut };
 };
 
-let eventSeq = 1000;
+function Shell() {
+  const toast = useToast();
+  const now = useNow(1000);
 
-function App() {
-  return (
-    <ToastProvider>
-      <Root />
-    </ToastProvider>
-  );
-}
+  // ── пользователи и сессия ──
+  const [users, setUsers] = useState<StoredUser[]>(() => getStoredUsers());
+  const [me, setMe] = useState<string | null>(() => {
+    const s = getSession();
+    return s && getStoredUsers().some((u) => u.login === s.login) ? s.login : null;
+  });
+  const [loginBusy, setLoginBusy] = useState(false);
+  const [loginErr, setLoginErr] = useState<string | null>(null);
 
-function Root() {
-  const [session, setSession] = useState<string | null>(() => localStorage.getItem("kontur_session"));
-  if (!session) {
+  // ── флот и телеметрия ──
+  const [servers, setServers] = useState<Server[]>([]);
+  const [metrics, setMetrics] = useState<MetricsMap>({});
+  const serversRef = useRef(servers);
+  const metricsRef = useRef(metrics);
+  useEffect(() => { serversRef.current = servers; }, [servers]);
+  useEffect(() => { metricsRef.current = metrics; }, [metrics]);
+
+  // ── события / аудит ──
+  const [events, setEvents] = useState<AuditEvent[]>(() => [
+    { id: uid(), time: timeStr(), user: "system", type: "system", severity: "info", text: "реестр агентов: подключений нет, ожидание рукопожатий" },
+    { id: uid(), time: timeStr(), user: "system", type: "system", severity: "ok", text: "KONTUR·OPS v2.4.1: консоль запущена, сборщик телеметрии активен" },
+  ]);
+  const meRef = useRef(me);
+  useEffect(() => { meRef.current = me; }, [me]);
+
+  const pushEvent = useCallback((type: AuditEvent["type"], severity: AuditEvent["severity"], text: string, user?: string) => {
+    setEvents((e) => [{ id: uid(), time: timeStr(), user: user ?? meRef.current ?? "system", type, severity, text }, ...e].slice(0, 200));
+  }, []);
+
+  // ── UI-состояние ──
+  const [tab, setTab] = useState<Tab>("dashboard");
+  const [activeServer, setActiveServer] = useState<string | null>(null);
+  const [detailTab, setDetailTab] = useState("overview");
+  const [termServer, setTermServer] = useState<string | null>(null);
+  const [addOpen, setAddOpen] = useState(false);
+  const [search, setSearch] = useState("");
+
+  // ── авторизация ──
+  const createAdmin = useCallback(async (login: string, pw: string) => {
+    setLoginBusy(true);
+    setLoginErr(null);
+    const { salt, hash } = await hashPassword(pw);
+    const u: StoredUser = { id: uid(), login, role: "admin", createdAt: Date.now(), salt, hash };
+    const next = [...getStoredUsers(), u];
+    saveUsers(next); setUsers(next);
+    setSession(login, true);
+    setMe(login);
+    pushEvent("user", "ok", `первичная настройка: создана учётная запись администратора «${login}»`, "system");
+    toast(`Администратор «${login}» создан. Добро пожаловать!`, "ok");
+    setLoginBusy(false);
+  }, [pushEvent, toast]);
+
+  const doLogin = useCallback(async (login: string, pw: string, remember: boolean) => {
+    setLoginBusy(true);
+    setLoginErr(null);
+    await new Promise((r) => setTimeout(r, 450));
+    const u = getStoredUsers().find((x) => x.login.toLowerCase() === login.toLowerCase());
+    if (!u) {
+      setLoginErr("Пользователь не найден");
+      pushEvent("auth", "warn", `неудачный вход: неизвестный логин «${login}»`, "system");
+      setLoginBusy(false);
+      return;
+    }
+    const ok = await verifyPassword(pw, u.salt, u.hash);
+    if (!ok) {
+      setLoginErr("Неверный пароль. Попытка записана в журнал аудита.");
+      pushEvent("auth", "warn", `неудачный вход: «${u.login}» — неверный пароль`, "system");
+      setLoginBusy(false);
+      return;
+    }
+    const next = getStoredUsers().map((x) => (x.id === u.id ? { ...x, lastLoginAt: Date.now() } : x));
+    saveUsers(next); setUsers(next);
+    setSession(u.login, remember);
+    setMe(u.login);
+    pushEvent("auth", "ok", `вход в консоль (${ROLE_META[u.role].label.toLowerCase()})`, u.login);
+    toast(`Сессия открыта: ${u.login}`, "ok");
+    setLoginBusy(false);
+  }, [pushEvent, toast]);
+
+  const logout = useCallback(() => {
+    pushEvent("auth", "info", "выход из консоли, сессия закрыта");
+    clearSession();
+    setMe(null);
+    setTab("dashboard");
+  }, [pushEvent]);
+
+  // ── агенты ──
+  const addAgent = useCallback((srv: Server) => {
+    setServers((p) => [...p, srv]);
+    setMetrics((p) => ({ ...p, [srv.id]: seedFor(srv) }));
+    spawnSim(srv.id, (text, sev) => pushEvent("agent", sev, `${srv.name}: ${text}`, "system"));
+    pushEvent("agent", "ok", `агент «${srv.name}» (${srv.ip}:${srv.port}) прошёл рукопожатие и добавлен в реестр`);
+  }, [pushEvent]);
+
+  const removeAgent = useCallback((id: string) => {
+    const s = serversRef.current.find((x) => x.id === id);
+    stopSim(id);
+    setServers((p) => p.filter((x) => x.id !== id));
+    setMetrics((p) => { const n = { ...p }; delete n[id]; return n; });
+    if (s) pushEvent("agent", "warn", `агент «${s.name}» удалён из реестра, токен отозван`);
+    toast(s ? `Агент «${s.name}» удалён из реестра` : "Агент удалён", "info");
+    setTab("servers");
+  }, [pushEvent, toast]);
+
+  // ── пользователи (RBAC) ──
+  const addUser = useCallback(async (login: string, pw: string, role: Role): Promise<string | null> => {
+    if (getStoredUsers().some((u) => u.login.toLowerCase() === login.toLowerCase())) return "Такой логин уже существует";
+    const { salt, hash } = await hashPassword(pw);
+    const u: StoredUser = { id: uid(), login, role, createdAt: Date.now(), salt, hash };
+    const next = [...getStoredUsers(), u];
+    saveUsers(next); setUsers(next);
+    pushEvent("user", "ok", `создан пользователь «${login}» (роль: ${ROLE_META[role].label})`);
+    return null;
+  }, [pushEvent]);
+
+  const setUserRole = useCallback((id: string, role: Role) => {
+    const u = getStoredUsers().find((x) => x.id === id);
+    const next = getStoredUsers().map((x) => (x.id === id ? { ...x, role } : x));
+    saveUsers(next); setUsers(next);
+    if (u) pushEvent("user", "warn", `«${u.login}»: роль изменена на «${ROLE_META[role].label}»`);
+  }, [pushEvent]);
+
+  const removeUser = useCallback((id: string) => {
+    const u = getStoredUsers().find((x) => x.id === id);
+    const next = getStoredUsers().filter((x) => x.id !== id);
+    saveUsers(next); setUsers(next);
+    if (u) pushEvent("user", "warn", `пользователь «${u.login}» удалён`);
+  }, [pushEvent]);
+
+  const changePassword = useCallback(async (cur: string, nextPw: string): Promise<string | null> => {
+    const u = getStoredUsers().find((x) => x.login === meRef.current);
+    if (!u) return "Сессия недействительна";
+    if (!(await verifyPassword(cur, u.salt, u.hash))) return "Текущий пароль неверен";
+    const { salt, hash } = await hashPassword(nextPw);
+    const next = getStoredUsers().map((x) => (x.id === u.id ? { ...x, salt, hash } : x));
+    saveUsers(next); setUsers(next);
+    pushEvent("user", "ok", `«${u.login}»: пароль изменён`);
+    return null;
+  }, [pushEvent]);
+
+  // ── тик телеметрии ──
+  useEffect(() => {
+    if (!me) return;
+    const t = window.setInterval(() => {
+      const list = serversRef.current;
+      if (!list.length) return;
+      const pm = metricsRef.current;
+      const nextM: MetricsMap = {};
+      const statuses: Record<string, Server["status"]> = {};
+      list.forEach((s) => {
+        const m = pm[s.id];
+        if (!m || s.status === "offline") { if (m) nextM[s.id] = m; return; }
+        const wave = Math.sin(Date.now() / 26000 + s.baseCpu) * 6;
+        const cpu = clamp(s.baseCpu + wave + (Math.random() * 18 - 9), 2, 97);
+        const mem = clamp(s.baseMem + Math.sin(Date.now() / 40000 + s.baseMem) * 4 + (Math.random() * 8 - 4), 5, 97);
+        nextM[s.id] = {
+          cpu: [...m.cpu.slice(-(POINTS - 1)), cpu],
+          mem: [...m.mem.slice(-(POINTS - 1)), mem],
+          netIn: [...m.netIn.slice(-(POINTS - 1)), Math.random() * 60 + 5],
+          netOut: [...m.netOut.slice(-(POINTS - 1)), Math.random() * 30 + 2],
+        };
+        statuses[s.id] = cpu > 78 ? "warning" : "online";
+      });
+      setMetrics((p) => ({ ...p, ...nextM }));
+      setServers((p) => p.map((s) => (statuses[s.id] ? { ...s, status: statuses[s.id], lastSeen: timeStr() } : s)));
+    }, 2000);
+    return () => window.clearInterval(t);
+  }, [me]);
+
+  const resetConsole = useCallback(() => {
+    pushEvent("system", "warn", "полный сброс данных консоли (пользователи, сессия, настройки)", "system");
+    resetAll();
+    window.location.reload();
+  }, [pushEvent]);
+
+  // ── рендер ──
+  if (!me) {
     return (
       <Login
-        onLogin={(login, remember) => {
-          if (remember) localStorage.setItem("kontur_session", login);
-          setSession(login);
-        }}
+        mode={users.length ? "login" : "setup"}
+        busy={loginBusy}
+        error={loginErr}
+        onLogin={doLogin}
+        onCreate={createAdmin}
       />
     );
   }
-  return <Shell login={session} onLogout={() => { localStorage.removeItem("kontur_session"); setSession(null); }} />;
-}
 
-function Shell({ login, onLogout }: { login: string; onLogout: () => void }) {
-  const toast = useToast();
-  const [page, setPage] = useState<Page>({ name: "dashboard" });
-  const [servers, setServers] = useState<Server[]>(SERVERS);
-  const [users, setUsers] = useState<User[]>(USERS);
-  const [events, setEvents] = useState<AuditEvent[]>(INITIAL_EVENTS);
-  const [metrics, setMetrics] = useState<MetricsMap>(() => seedMetrics(SERVERS));
-  const [query, setQuery] = useState("");
-  const [search, setSearch] = useState("");
-  const [sideOpen, setSideOpen] = useState(false);
-  const [termServer, setTermServer] = useState<string>("s3");
-  const serversRef = useRef(servers);
-  serversRef.current = servers;
+  const meUser = users.find((u) => u.login === me);
+  const detailServer = servers.find((s) => s.id === activeServer) ?? null;
+  const termSrv = servers.find((s) => s.id === termServer) ?? servers[0] ?? null;
 
-  const logEvent = useCallback((type: AuditEvent["type"], severity: AuditEvent["severity"], text: string) => {
-    setEvents((e) => [{ id: eventSeq++, time: nowTime(), type, severity, text }, ...e].slice(0, 90));
-  }, []);
-
-  // телеметрия: шаг каждые 2 с
-  useEffect(() => {
-    const t = setInterval(() => setMetrics((m) => stepMetrics(m, serversRef.current)), 2000);
-    return () => clearInterval(t);
-  }, []);
-
-  // live-поток событий аудита
-  useEffect(() => {
-    const t = setInterval(() => {
-      const pool = serversRef.current.filter((s) => s.status !== "offline");
-      if (!pool.length) return;
-      const s = pool[Math.floor(Math.random() * pool.length)];
-      const gen = LIVE_EVENT_POOL[Math.floor(Math.random() * LIVE_EVENT_POOL.length)];
-      const e = gen(s);
-      setEvents((ev) => [{ id: eventSeq++, time: nowTime(), ...e }, ...ev].slice(0, 90));
-    }, 6500);
-    return () => clearInterval(t);
-  }, []);
-
-  const openServer = useCallback((id: string, tab = "overview") => setPage({ name: "server", id, tab }), []);
-
-  const addServer = useCallback((s: Server) => {
-    setServers((prev) => [...prev, s]);
-    setMetrics((m) => ({ ...m, ...seedMetrics([s]) }));
-    logEvent("agent", "ok", `новый агент ${s.name} (${s.ip}:${s.port}) добавлен в реестр, токен валидирован`);
-  }, [logEvent]);
-
-  const deleteServer = useCallback((id: string) => {
-    const s = serversRef.current.find((x) => x.id === id);
-    setServers((prev) => prev.filter((x) => x.id !== id));
-    setPage({ name: "servers" });
-    if (s) {
-      toast(`Агент ${s.name} удалён из реестра`, "info");
-      logEvent("agent", "warn", `агент ${s.name} удалён из реестра (admin), хэш токена уничтожен`);
-    }
-  }, [toast, logEvent]);
-
-  const nav = useMemo(() => {
-    const alerts = servers.filter((s) => s.status !== "online").length;
-    return ([
-      ["dashboard", "Обзор", "grid", null],
-      ["servers", "Серверы", "server", servers.length],
-      ["terminal", "Терминал", "terminal", null],
-      ["users", "Пользователи", "users", users.length],
-      ["audit", "Аудит", "scroll", alerts || null],
-      ["docs", "Архитектура", "book", null],
-      ["settings", "Настройки", "gear", null],
-    ] as [Page["name"], string, IconName, number | null][]);
-  }, [servers, users]);
-
-  const current = servers.find((s) => page.name === "server" && s.id === page.id);
-  const onlineForTerm = servers.filter((s) => s.status !== "offline");
-  const activeTerm = onlineForTerm.find((s) => s.id === termServer) ?? onlineForTerm[0];
+  const openServer = (id: string, t?: string) => {
+    setActiveServer(id);
+    setDetailTab(t ?? "overview");
+    setTab("detail");
+  };
 
   return (
-    <div className="min-h-screen flex">
-      {/* ── сайдбар ── */}
-      {sideOpen && <div className="fixed inset-0 bg-black/60 z-40 lg:hidden" onClick={() => setSideOpen(false)} />}
-      <aside className={`fixed lg:sticky top-0 h-screen z-50 w-[228px] shrink-0 border-r border-line bg-panel/95 backdrop-blur-sm flex flex-col transition-transform duration-300 ${sideOpen ? "translate-x-0" : "-translate-x-full lg:translate-x-0"}`}>
-        <div className="flex items-center gap-2.5 px-4 h-16 border-b border-line">
+    <div className="flex min-h-screen">
+      {/* ── sidebar ── */}
+      <aside className="w-[218px] shrink-0 border-r border-line bg-panel/70 backdrop-blur-sm flex flex-col sticky top-0 h-screen">
+        <button onClick={() => setTab("dashboard")} className="flex items-center gap-2.5 px-4 h-[62px] border-b border-line cursor-pointer text-left">
           <BrandMark small />
           <div>
-            <div className="font-display font-extrabold text-[15px] tracking-[0.14em] leading-none">KONTUR<span className="text-amber">·OPS</span></div>
-            <div className="font-mono text-[9px] text-dim tracking-[0.2em] mt-1">FLEET CONTROL v2.4</div>
+            <div className="font-display font-extrabold text-[15px] tracking-widest leading-none">KONTUR<span className="text-amber">·OPS</span></div>
+            <div className="font-mono text-[9px] text-dim tracking-[0.18em] mt-1">linux fleet console</div>
           </div>
-        </div>
-
-        <nav className="flex-1 py-4 px-2.5 space-y-1 overflow-y-auto">
-          <div className="lbl px-3 pb-2">управление</div>
-          {nav.slice(0, 3).map(([id, label, ic, badge]) => (
-            <NavItem key={id} active={page.name === id || (page.name === "server" && id === "servers")} label={label} icon={ic} badge={badge}
-              onClick={() => { setPage({ name: id } as Page); setSideOpen(false); }} />
-          ))}
-          <div className="lbl px-3 pt-4 pb-2">система</div>
-          {nav.slice(3).map(([id, label, ic, badge]) => (
-            <NavItem key={id} active={page.name === id} label={label} icon={ic} badge={badge} badgeColor={id === "audit" ? "#ffb224" : undefined}
-              onClick={() => { setPage({ name: id } as Page); setSideOpen(false); }} />
-          ))}
-        </nav>
-
-        <div className="p-3 border-t border-line">
-          <div className="card bg-panel2/70 p-3">
-            <div className="flex items-center gap-2.5">
-              <span className="w-8 h-8 rounded-lg bg-amber/15 border border-amber/40 text-amber flex items-center justify-center font-display font-bold text-[12px]">
-                {login.slice(0, 2).toUpperCase()}
-              </span>
-              <div className="min-w-0">
-                <div className="font-mono text-[12px] truncate">@{login}</div>
-                <div className="font-mono text-[10px] text-ok flex items-center gap-1"><span className="w-1 h-1 rounded-full bg-ok" /> admin · 2FA</div>
-              </div>
-              <button onClick={() => { toast("Сессия завершена, токен отозван", "info"); onLogout(); }}
-                className="ml-auto p-1.5 rounded-md text-mut hover:text-bad hover:bg-bad/10 transition-colors cursor-pointer" title="Выйти">
-                <Icon n="out" size={15} />
+        </button>
+        <nav className="flex-1 py-3 px-2.5 space-y-0.5 overflow-y-auto">
+          {NAV.map((n) => {
+            const active = tab === n.id || (n.id === "servers" && tab === "detail");
+            return (
+              <button key={n.id} onClick={() => setTab(n.id)}
+                className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-[13px] font-medium transition-all cursor-pointer relative ${
+                  active ? "text-amber bg-amber/10" : "text-mut hover:text-ink hover:bg-raise/70"}`}>
+                {active && <span className="absolute left-0 top-2 bottom-2 w-[3px] rounded-full bg-amber" />}
+                <Icon n={n.icon} size={16} />
+                {n.label}
+                {n.id === "servers" && servers.length > 0 && (
+                  <span className="ml-auto font-mono text-[10px] px-1.5 py-0.5 rounded bg-raise border border-line text-mut">{servers.length}</span>
+                )}
+                {n.id === "audit" && (
+                  <span className="ml-auto font-mono text-[10px] px-1.5 py-0.5 rounded bg-raise border border-line text-mut">{events.length}</span>
+                )}
               </button>
-            </div>
+            );
+          })}
+        </nav>
+        <div className="px-4 py-3.5 border-t border-line">
+          <div className="font-mono text-[10px] text-dim leading-relaxed">
+            v2.4.1 · ws :8443<br />агентов: {servers.length} · поток live
           </div>
         </div>
       </aside>
 
-      {/* ── основная область ── */}
+      {/* ── main ── */}
       <div className="flex-1 min-w-0 flex flex-col">
-        <header className="sticky top-0 z-30 h-16 border-b border-line bg-bg/85 backdrop-blur-md flex items-center gap-3 px-4 lg:px-6">
-          <button onClick={() => setSideOpen(true)} className="lg:hidden p-2 -ml-1 rounded-md text-mut hover:text-ink hover:bg-raise transition-colors cursor-pointer"><Icon n="menu" size={18} /></button>
-          <div className="min-w-0">
-            <div className="font-display font-bold text-[15px] tracking-wide truncate">{PAGE_TITLE[page.name]}</div>
-            <div className="font-mono text-[10px] text-dim tracking-wider hidden sm:block">kontur-core · {servers.filter((s) => s.status !== "offline").length}/{servers.length} агентов в сети</div>
+        <header className="h-[62px] shrink-0 border-b border-line bg-panel/60 backdrop-blur-sm flex items-center gap-4 px-5 sticky top-0 z-30">
+          <h1 className="font-display font-semibold text-[15px] tracking-wide whitespace-nowrap">
+            {NAV.find((n) => n.id === (tab === "detail" ? "servers" : tab))?.label ?? ""}
+            {tab === "detail" && detailServer && <span className="text-dim font-mono text-[12px] font-normal"> / {detailServer.name}</span>}
+          </h1>
+          <div className="flex-1 max-w-[340px] ml-2">
+            <div className="relative">
+              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-dim"><Icon n="search" size={14} /></span>
+              <input value={search} onChange={(e) => { setSearch(e.target.value); if (tab !== "servers") setTab("servers"); }}
+                placeholder="Поиск: имя или IP агента…"
+                className="w-full bg-panel border border-line rounded-lg pl-9 pr-3 py-1.5 text-[12.5px] font-mono placeholder:text-dim focus:border-amber/60 focus:bg-panel2 transition-colors outline-none" />
+            </div>
           </div>
-
-          <form
-            className="ml-auto relative hidden md:block"
-            onSubmit={(e) => { e.preventDefault(); setQuery(search); setPage({ name: "servers" }); }}
-          >
-            <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-dim"><Icon n="search" size={14} /></span>
-            <input
-              value={search} onChange={(e) => setSearch(e.target.value)}
-              placeholder="поиск по реестру…"
-              className="w-56 bg-panel border border-line rounded-lg pl-8 pr-3 py-2 text-[12.5px] font-mono focus:border-amber/60 focus:w-72 outline-none transition-all placeholder:text-dim"
-            />
-          </form>
-
-          <div className="flex items-center gap-2 ml-auto md:ml-0">
-            <span className="hidden sm:flex items-center gap-1.5 font-mono text-[10.5px] text-ok border border-ok/25 bg-ok/6 rounded-md px-2 py-1.5">
-              <Icon n="wifi" size={12} /> ws connected
-            </span>
-            <Clock />
+          <div className="ml-auto flex items-center gap-3.5">
+            <div className="hidden md:block text-right">
+              <div className="font-mono text-[13px] tnum text-ink">{now.toTimeString().slice(0, 8)}</div>
+              <div className="font-mono text-[9.5px] text-dim tracking-wider">{now.toLocaleDateString("ru-RU", { day: "2-digit", month: "short" })} · UTC{-(new Date().getTimezoneOffset() / 60) >= 0 ? "+" : ""}{-(new Date().getTimezoneOffset() / 60)}</div>
+            </div>
+            <div className="flex items-center gap-2.5 pl-3.5 border-l border-line">
+              <div className="text-right hidden sm:block">
+                <div className="font-mono text-[12.5px] leading-tight">{me}</div>
+                <div className="font-mono text-[9.5px]" style={{ color: meUser ? ROLE_META[meUser.role].color : "#8595ad" }}>
+                  {meUser ? ROLE_META[meUser.role].label.toLowerCase() : "—"}
+                </div>
+              </div>
+              <button onClick={logout} title="Выйти"
+                className="p-2 rounded-lg border border-line text-mut hover:text-bad hover:border-bad/40 hover:bg-bad/8 transition-colors cursor-pointer">
+                <Icon n="logout" size={15} />
+              </button>
+            </div>
           </div>
         </header>
 
-        <main className="flex-1 p-4 lg:p-6 max-w-[1560px] w-full mx-auto">
-          {page.name === "dashboard" && (
-            <Dashboard servers={servers} metrics={metrics} events={events} onOpen={openServer} onServers={() => setPage({ name: "servers" })} />
+        <main className="flex-1 p-5 lg:p-7 max-w-[1460px] w-full mx-auto">
+          {tab === "dashboard" && (
+            <Dashboard servers={servers} metrics={metrics} events={events}
+              onOpen={openServer} onServers={() => setTab("servers")} onAdd={() => setAddOpen(true)} />
           )}
-          {page.name === "servers" && (
-            <Servers servers={servers} metrics={metrics} onOpen={openServer} onAdd={addServer} query={query} />
+          {tab === "servers" && (
+            <Servers servers={servers} metrics={metrics} query={search}
+              onOpen={openServer} onAdd={() => setAddOpen(true)} />
           )}
-          {page.name === "server" && current && (
-            <ServerDetail
-              server={current} metrics={metrics} tab={page.tab}
-              onTab={(t) => setPage({ name: "server", id: current.id, tab: t })}
-              onBack={() => setPage({ name: "servers" })}
-              onDelete={deleteServer} logEvent={logEvent}
-            />
+          {tab === "detail" && detailServer && (
+            <ServerDetail server={detailServer} metrics={metrics} tab={detailTab} onTab={setDetailTab}
+              onBack={() => setTab("servers")} onDelete={removeAgent} logEvent={pushEvent} />
           )}
-          {page.name === "server" && !current && (
-            <div className="card p-10 text-center text-mut">Сервер удалён из реестра. <button onClick={() => setPage({ name: "servers" })} className="text-amber cursor-pointer">Вернуться к реестру</button></div>
-          )}
-          {page.name === "terminal" && (
+          {tab === "terminal" && (
             <div className="space-y-4">
-              <div className="flex flex-wrap items-center gap-3">
-                <div className="anim-rise">
-                  <h2 className="font-display text-xl font-bold tracking-wide">Глобальный терминал</h2>
-                  <p className="text-[13px] text-mut mt-0.5">Интерактивный bash без прямого SSH — PTY открывается на агенте, поток идёт через exec-relay консоли</p>
+              {servers.length === 0 ? (
+                <div className="card p-10 text-center anim-pop max-w-2xl mx-auto">
+                  <span className="inline-flex p-3 rounded-xl bg-panel2 border border-line2 text-dim mb-4"><Icon n="terminal" size={26} /></span>
+                  <h2 className="font-display font-bold text-lg mb-1.5">Терминалу некуда подключаться</h2>
+                  <p className="text-[13px] text-mut mb-6">
+                    Веб-bash работает через PTY на агенте: сначала подключите хотя бы один узел —
+                    и здесь появится интерактивная консоль без прямого SSH.
+                  </p>
+                  <button onClick={() => setAddOpen(true)}
+                    className="px-5 py-2.5 rounded-lg bg-amber text-bg font-display font-bold text-[13px] tracking-wide hover:bg-[#ffc14d] active:scale-[0.97] transition-all cursor-pointer inline-flex items-center gap-2">
+                    <Icon n="plus" size={14} /> ПОДКЛЮЧИТЬ АГЕНТА
+                  </button>
                 </div>
-                <select
-                  value={activeTerm?.id ?? ""}
-                  onChange={(e) => setTermServer(e.target.value)}
-                  className="ml-auto bg-panel border border-line rounded-lg px-3 py-2.5 font-mono text-[13px] outline-none focus:border-amber/60 cursor-pointer"
-                >
-                  {onlineForTerm.map((s) => <option key={s.id} value={s.id}>{s.name} · {s.ip}</option>)}
-                </select>
-              </div>
-              {activeTerm ? (
-                <Terminal key={activeTerm.id} server={activeTerm} height={560}
-                  onCommand={(c) => c.trim() && logEvent("exec", "info", `admin → ${activeTerm.name}: ${c.slice(0, 64)}`)} />
               ) : (
-                <div className="card p-10 text-center text-mut">Нет агентов онлайн</div>
-              )}
-              <div className="grid sm:grid-cols-3 gap-3">
-                {([
-                  ["PTY, а не построчный exec", "терминал отдаёт настоящий PTY: vim, top, htop работают как по SSH"],
-                  ["каждая команда — в аудит", "кто, когда, на каком хосте и что исполнил: append-only журнал"],
-                  ["ролевой доступ", "viewer видит только метрики, operator — команды, admin — всё"],
-                ] as [string, string][]).map(([t, d], i) => (
-                  <div key={t} className="card p-4 anim-rise" style={{ animationDelay: `${i * 70}ms` }}>
-                    <div className="flex items-center gap-2 text-ok mb-1.5"><Icon n="terminal" size={14} /><span className="font-display font-semibold text-[13px]">{t}</span></div>
-                    <p className="text-[12px] text-mut leading-relaxed">{d}</p>
+                <>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="lbl mr-1">узел:</span>
+                    {servers.map((s) => (
+                      <button key={s.id} onClick={() => setTermServer(s.id)} disabled={s.status === "offline"}
+                        className={`px-3 py-1.5 rounded-md text-[12px] font-mono border transition-colors cursor-pointer flex items-center gap-2 disabled:opacity-35 disabled:cursor-not-allowed ${
+                          termSrv?.id === s.id ? "border-amber/60 text-amber bg-amber/10" : "border-line text-mut hover:border-line2"}`}>
+                        <span className={`w-1.5 h-1.5 rounded-full ${s.status === "online" ? "bg-ok" : s.status === "warning" ? "bg-amber" : "bg-bad"}`} />
+                        {s.name}
+                      </button>
+                    ))}
                   </div>
-                ))}
-              </div>
+                  {termSrv && (
+                    <Terminal server={termSrv} height={520}
+                      onCommand={(cmd) => pushEvent("exec", "info", `${termSrv.name}: ${cmd}`)} />
+                  )}
+                </>
+              )}
             </div>
           )}
-          {page.name === "users" && <UsersPage users={users} onChange={setUsers} logEvent={logEvent} selfLogin={login} />}
-          {page.name === "audit" && <AuditPage events={events} />}
-          {page.name === "docs" && <Docs />}
-          {page.name === "settings" && <SettingsPage logEvent={logEvent} />}
+          {tab === "users" && (
+            <UsersPage users={users} me={me} onAdd={addUser} onRole={setUserRole} onRemove={removeUser} />
+          )}
+          {tab === "audit" && <AuditPage events={events} />}
+          {tab === "settings" && (
+            <SettingsPage me={me}
+              counts={{ agents: servers.length, users: users.length, audit: events.length }}
+              onChangePassword={changePassword} onReset={resetConsole} />
+          )}
+          {tab === "docs" && <Docs />}
         </main>
-
-        <footer className="border-t border-line px-4 lg:px-6 py-3 flex items-center gap-4 font-mono text-[10.5px] text-dim flex-wrap">
-          <span>KONTUR OPS v2.4.1</span>
-          <span className="hidden sm:inline">агенты: go 1.22 · консоль: node 20 · БД: postgres 16 + timescale</span>
-          <span className="ml-auto flex items-center gap-1.5"><span className="w-1.5 h-1.5 rounded-full bg-ok ring-pulse" style={{ ["--ring-c" as string]: "#3ecf8e66" }} /> телеметрия: поток активен, шаг 2 c</span>
-        </footer>
       </div>
+
+      <AddAgent open={addOpen} onClose={() => setAddOpen(false)} onAdded={addAgent} />
     </div>
   );
 }
 
-function NavItem({ active, label, icon, badge, badgeColor, onClick }: {
-  active: boolean; label: string; icon: IconName; badge?: number | null; badgeColor?: string; onClick: () => void;
-}) {
+export default function App() {
   return (
-    <button onClick={onClick}
-      className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-[13.5px] font-medium transition-all cursor-pointer relative ${active ? "bg-raise text-ink" : "text-mut hover:text-ink hover:bg-raise/50"}`}>
-      {active && <span className="absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-5 rounded-r bg-amber" />}
-      <Icon n={icon} size={16} className={active ? "text-amber" : ""} />
-      {label}
-      {badge != null && badge > 0 && (
-        <span className="ml-auto font-mono text-[10.5px] px-1.5 py-0.5 rounded-md border" style={{ color: badgeColor ?? "#8595ad", borderColor: (badgeColor ?? "#8595ad") + "55", background: (badgeColor ?? "#8595ad") + "12" }}>
-          {badge}
-        </span>
-      )}
-    </button>
+    <ToastProvider>
+      <Shell />
+    </ToastProvider>
   );
 }
-
-function Clock() {
-  const [now, setNow] = useState(() => new Date());
-  useEffect(() => {
-    const t = setInterval(() => setNow(new Date()), 1000);
-    return () => clearInterval(t);
-  }, []);
-  return (
-    <div className="text-right leading-tight">
-      <div className="font-mono text-[14px] font-bold tnum">{now.toLocaleTimeString("ru-RU", { hour12: false })}</div>
-      <div className="font-mono text-[9.5px] text-dim tracking-wider">{now.toLocaleDateString("ru-RU", { day: "2-digit", month: "short" }).toUpperCase()}</div>
-    </div>
-  );
-}
-
-export default App;
